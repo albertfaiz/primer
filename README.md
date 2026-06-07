@@ -121,11 +121,15 @@ validator, or extend the rule set without touching the layers around them.
 
 ```
   1  ingest        load + infer a semantic type & role for every column
+                   (+ memory-safe stratified sampling)
+  1.5 conditioner  robust scaling · NaN/inf handling · matrix stabilisation
   2  task          resolve regression / classification / unsupervised
   3  diagnostics   leakage · imbalance · collinearity · missingness · temporal
-  4a metafeatures  shape · dependence (mutual information) · distribution shape
+                   · high-cardinality · autocorrelation · class-overlap
+                   · intrinsic-dimensionality · redundancy · heteroskedasticity
+  4a metafeatures  shape · dependence (MI) · distribution · intrinsic dimension
   4b landmarks     cheap NumPy models whose *scores* reveal structure
-  5  recommend     the rule engine — turns evidence into an explained shortlist
+  5  recommend     the lens-aware rule engine — evidence → explained shortlist
   6  validate      cheap-proxy / successive-halving validation   (ROADMAP)
   7  confidence    calibrate the prior against measured curves   (ROADMAP)
 ```
@@ -238,18 +242,62 @@ not a rewrite.
 
 | module | layer | responsibility |
 |---|---|---|
-| `ingest.py` | 1 | load + semantic column typing |
+| `ingest.py` | 1 | load + semantic column typing + stratified sampling |
+| `conditioner.py` | 1.5 | robust scaling, NaN/inf handling, matrix stabilisation |
 | `task.py` | 2 | regression / classification / unsupervised |
 | `diagnostics.py` | 3 | data-quality and validity checks |
 | `metafeatures.py` | 4a | statistical + information-theoretic descriptors |
 | `landmarking.py` | 4b | cheap NumPy probe models + CV harness |
-| `numpyx.py` | — | pure-NumPy kernels (skew, entropy, MI, condition number) |
+| `numpyx.py` | — | pure-NumPy kernels (skew, entropy, MI, SVD, robust scale) |
 | `registry.py` | — | capability-based model catalogue (extension hub) |
 | `rules.py` | 5 | the rule engine + rule set |
+| `lenses.py` | 5 | domain weight profiles (inversion-of-control hook) |
 | `recommend.py` | 5 | `Recommender` interface, scoring, confidence |
 | `validate.py` | 6 | cheap-proxy validation interface (stub) |
 | `report.py` | — | text rendering |
 | `core.py` | — | `Primer` orchestrator + `analyze()` |
 | `types.py` | — | shared, serialisable data structures |
 
-`__version__ = "0.1.0"`
+## Changelog
+
+### 0.2.0 — robustness, signal, and reach
+
+Driven by an 8-scenario adversarial stress test. Four real bugs fixed, plus
+genuinely new capability:
+
+**Fixed**
+- **Backend-independent numerics.** A new **Conditioner** layer (1.5) robustly
+  scales (median/IQR), strips degenerate columns, winsorises outliers, and
+  stabilises every matrix before linear algebra; all matmul/solve paths are
+  `errstate`-guarded with an lstsq fallback. The `RuntimeWarning` storm that
+  appeared on some BLAS backends (e.g. Apple Accelerate) but not others is gone
+  — verified clean even with warnings promoted to errors.
+- **High-cardinality categoricals** (e.g. `"ID_273"`, zip codes) are no longer
+  misclassified as free-text and dropped; they are treated as categoricals and
+  surfaced to the categorical-handling rule, so CatBoost/LightGBM are correctly
+  recommended.
+- **Weak-signal detection** now measures **lift over the baseline learner**, which
+  is correct for both R² (baseline 0) and balanced accuracy (baseline ~0.5).
+  Pure noise no longer reads as learnable: it fires a weak-signal flag, caps
+  confidence **LOW**, and advises investing in features/data, not a bigger model.
+- **Reason salience.** Structural findings ("linear suffices", "categorical-heavy")
+  now headline the explanation instead of a generic "only N rows" prior; the
+  sample-size rule was down-weighted. Scores still sum all evidence — only the
+  *display order* changed.
+
+**Added**
+- New diagnostics: intrinsic (effective) dimensionality via SVD spectrum, class
+  overlap via standardised centroid distance, row-sequential autocorrelation
+  (temporal/spatial leakage), feature redundancy, and heteroskedasticity.
+- **Domain lenses** (`lens="genomics"|"clinical"|"finance"` or a custom
+  `{rule: multiplier}` dict): an inversion-of-control hook to inject field
+  priors without forking the engine. (Bundled lenses are tunable starting
+  weights, *not* validated domain priors — see `primer.lenses`.)
+- Memory-safe **stratified sampling** so rare classes survive sub-sampling of
+  large datasets; global deterministic seeding for reproducibility.
+
+### 0.1.0
+Initial release: 7-layer pipeline, 16-model registry, 13-rule capability-voting
+engine, landmark structure detection, explained & confidence-scored shortlist.
+
+`__version__ = "0.2.0"`
