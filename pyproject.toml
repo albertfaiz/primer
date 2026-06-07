@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "primer-ml"
+version = "0.1.0"
+description = "A fast, transparent model-selection brief for tabular ML — profile a dataset and get an explained, confidence-scored shortlist of models to try."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Faiz Ahmad" }]
+keywords = ["machine-learning", "automl", "model-selection", "tabular", "data-science"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "numpy>=1.22",
+    "pandas>=2.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/albertfaiz/primer"
+Repository = "https://github.com/albertfaiz/primer"
+Issues = "https://github.com/albertfaiz/primer/issues"
+
+[tool.setuptools.packages.find]
+include = ["primer*"]
