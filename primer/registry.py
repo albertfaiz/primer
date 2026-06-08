@@ -94,12 +94,12 @@ _MODELS: List[ModelSpec] = [
 
     # ---- bagged trees -------------------------------------------------------
     ModelSpec("rf", "Random Forest", "forest", [_REG, _CLF],
-              caps=dict(nonlinearity=0.85, interactions=0.85, native_categorical=0.4,
-                        scales_large_n=0.6, robust_missing=0.3, robust_outliers=0.7,
-                        fast_train=0.6, class_weighting=1.0, low_n_friendly=0.7,
-                        interpretable=0.5),
-              library_hint="scikit-learn (RandomForest)",
-              notes="robust, low-tuning baseline; usually a touch behind boosting"),
+          caps=dict(nonlinearity=0.85, interactions=0.85, native_categorical=0.4,
+                    scales_large_n=0.6, robust_missing=0.3, robust_outliers=0.9, # <-- Elevated
+                    fast_train=0.6, class_weighting=1.0, low_n_friendly=0.7,
+                    interpretable=0.5),
+          library_hint="scikit-learn (RandomForest)",
+          notes="robust, low-tuning baseline; exceptional at resisting noise and variance"),
 
     # ---- instance / kernel --------------------------------------------------
     ModelSpec("knn", "k-Nearest Neighbours", "instance", [_REG, _CLF],

@@ -153,6 +153,20 @@ RULES: List[Rule] = [
     ),
 
     # 4. weak signal everywhere (high noise) — measured as lift over baseline --
+
+    # 4.5 Moderate signal but high variance/noise ------------------------------
+    Rule(
+        "moderate_signal_high_noise",
+        "Probes beat the baseline, but absolute scores remain low — signal exists but is noisy.",
+        fires=lambda c: 1.0 if _has_landmarks(c) 
+        and _signal_lift(c) >= ACTIVATION_FLOOR # Signal exists
+        and _best_landmark(c) < 0.65            # But absolute performance is poor (high noise)
+        else 0.0,
+        votes=lambda c, s: {"robust_outliers": 1.5 * s, "nonlinearity": 0.5 * s, 
+                            "interactions": 0.5 * s, "interpretable": -0.5 * s},
+        rationale=lambda c, s: f"best probe scores {(_best_landmark(c)):.2f} (lift of {_signal_lift(c):+.2f}) — a noisy but learnable signal; favour variance-reducing ensembles (Random Forest) over strict linear or aggressive boosting.",
+        salience=2.1,
+    ),
     Rule(
         "low_signal_high_noise",
         "Even the best landmark barely beats the baseline learner — signal is weak / noisy.",
@@ -180,7 +194,8 @@ RULES: List[Rule] = [
         "Few rows — penalise neural nets / deep models, favour regularised & low-n-friendly.",
         fires=lambda c: 1.0 if c.f("n_rows") < 300 else
         (0.4 if c.f("n_rows") < 1_500 else 0.0),
-        votes=lambda c, s: {"low_n_friendly": 1.2 * s, "interpretable": 0.4 * s},
+        # DECREASED the reward for interpretable from 0.4 to 0.2
+        votes=lambda c, s: {"low_n_friendly": 1.2 * s, "interpretable": 0.2 * s},
         rationale=lambda c, s: f"only {int(c.f('n_rows')):,} rows — data-hungry models overfit; prefer regularised/low-variance learners and strong cross-validation.",
         salience=0.5,
     ),
