@@ -105,9 +105,16 @@ def extract_metafeatures(df: "pd.DataFrame", profile: DatasetProfile,
         mf["max_abs_correlation"] = float(np.max(np.abs(off)))
         mf["frac_highly_correlated_pairs"] = float(np.mean(np.abs(off) > 0.8))
         mf["condition_number"] = nx.condition_number(Xnum)
+        # intrinsic (effective) dimensionality from the PCA/SVD spectrum
+        k95, idr, pr = nx.intrinsic_dimensionality(Xnum)
+        mf["intrinsic_dim_95"] = k95
+        mf["intrinsic_dim_ratio"] = idr
+        mf["participation_ratio"] = pr
     else:
         mf.update(mean_abs_correlation=0.0, max_abs_correlation=0.0,
-                  frac_highly_correlated_pairs=0.0, condition_number=1.0)
+                  frac_highly_correlated_pairs=0.0, condition_number=1.0,
+                  intrinsic_dim_95=len(profile.numeric_features),
+                  intrinsic_dim_ratio=1.0, participation_ratio=1.0)
 
     # ---- feature <-> target dependence -----------------------------------
     if profile.target is not None and task.kind in (TaskKind.REGRESSION,
@@ -136,8 +143,17 @@ def extract_metafeatures(df: "pd.DataFrame", profile: DatasetProfile,
                 props = np.array(list(task.class_balance.values()))
                 mf["min_class_frac"] = float(props.min())
                 mf["imbalance_ratio"] = float(props.max() / max(props.min(), nx.EPS))
+            # geometric class overlap: can the classes even be separated?
+            if profile.numeric_features:
+                Xsep = np.column_stack([
+                    pd.to_numeric(df[c], errors="coerce").to_numpy(dtype=float)
+                    for c in profile.numeric_features])
+                mf["class_separation"] = nx.class_separation(Xsep, y)
         else:
             mf["target_skew"] = nx.skewness(y)
             mf["target_kurtosis"] = nx.kurtosis_excess(y)
+
+        # sequential dependency in the target (random CV would leak the future)
+        mf["target_autocorr"] = nx.lag1_autocorrelation(y.astype(float))
 
     return mf

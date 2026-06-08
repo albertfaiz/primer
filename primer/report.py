@@ -91,9 +91,12 @@ def render_full(report: "PrimerReport") -> str:
     L.append("KEY METAFEATURES")
     mf = report.metafeatures
     keys = ["n_rows", "n_features", "n_to_p_ratio", "frac_categorical",
-            "overall_missing_frac", "mean_abs_skew", "max_abs_correlation",
-            "condition_number", "mean_target_mi", "max_target_mi",
-            "frac_informative_features", "min_class_frac", "imbalance_ratio"]
+            "n_high_cardinality_cat", "overall_missing_frac", "mean_abs_skew",
+            "max_abs_correlation", "condition_number", "intrinsic_dim_95",
+            "intrinsic_dim_ratio", "frac_highly_correlated_pairs",
+            "mean_target_mi", "max_target_mi", "frac_informative_features",
+            "signal_lift", "heteroskedasticity", "class_separation",
+            "target_autocorr", "min_class_frac", "imbalance_ratio"]
     for k in keys:
         if k in mf and mf[k] is not None:
             v = mf[k]

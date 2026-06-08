@@ -24,6 +24,8 @@ TEXT_AVG_LEN = 35                  # avg chars above which an object col is "tex
 CATEGORICAL_MAX_UNIQUE = 50        # absolute ceiling for "categorical"
 CATEGORICAL_MAX_FRAC = 0.10        # cardinality / n ceiling for "categorical"
 ID_UNIQUE_FRAC = 0.98             # uniqueness above which a column looks like an id
+HIGH_CARDINALITY = 20              # n_unique above which a categorical is "high-cardinality"
+SEED = 0                           # global deterministic seed (reproducibility)
 
 
 def _looks_like_datetime(s: pd.Series) -> bool:
@@ -74,11 +76,14 @@ def _infer_type(s: pd.Series, n_rows: int) -> ColumnType:
     # object / string / category
     if n_unique >= ID_UNIQUE_FRAC * n_rows:
         return ColumnType.ID
-    avg_len = s.dropna().astype(str).str.len().mean() if s.notna().any() else 0
-    if (n_unique <= CATEGORICAL_MAX_UNIQUE or n_unique / n_rows < CATEGORICAL_MAX_FRAC) \
-            and (avg_len or 0) <= TEXT_AVG_LEN:
-        return ColumnType.CATEGORICAL
-    return ColumnType.TEXT
+    avg_len = s.dropna().astype(str).str.len().mean() if s.notna().any() else 0.0
+    # Genuinely long, free-form strings are text. Everything else below the ID
+    # threshold is a categorical — INCLUDING high-cardinality short codes like
+    # "ID_273" or zip codes, which native-categorical models (CatBoost/LightGBM)
+    # are built for. (v1 wrongly dropped these as text when cardinality was high.)
+    if (avg_len or 0) > TEXT_AVG_LEN:
+        return ColumnType.TEXT
+    return ColumnType.CATEGORICAL
 
 
 def load_frame(data: DataLike) -> "pd.DataFrame":
@@ -96,6 +101,39 @@ def load_frame(data: DataLike) -> "pd.DataFrame":
     return pd.read_csv(data)
 
 
+def _stratified_sample(df: "pd.DataFrame", target: str, max_rows: int,
+                       seed: int = SEED) -> "pd.DataFrame":
+    """Proportional stratified sample with a per-class floor.
+
+    A plain random sample of a 50M-row, 1%-minority dataset can wipe out the
+    minority class before the diagnostics ever see it. Stratifying on a
+    low-cardinality target guarantees every class survives the down-sample.
+    """
+    frac = max_rows / len(df)
+    parts = []
+    for _, idx in df.groupby(target, observed=True).groups.items():
+        sub = df.loc[idx]
+        take = min(len(sub), max(1, int(round(len(sub) * frac))))
+        parts.append(sub.sample(take, random_state=seed))
+    out = pd.concat(parts).sample(frac=1.0, random_state=seed).reset_index(drop=True)
+    if len(out) > max_rows:
+        out = out.sample(max_rows, random_state=seed).reset_index(drop=True)
+    return out
+
+
+def _sample_for_profiling(df: "pd.DataFrame", target: Optional[str],
+                          max_rows: int) -> "pd.DataFrame":
+    # stratify when the target looks categorical (few distinct values); otherwise
+    # a uniform random sample is the right reservoir.
+    if target is not None and target in df.columns:
+        try:
+            if df[target].nunique(dropna=True) <= CATEGORICAL_MAX_UNIQUE:
+                return _stratified_sample(df, target, max_rows)
+        except TypeError:
+            pass
+    return df.sample(max_rows, random_state=SEED).reset_index(drop=True)
+
+
 def profile_dataset(data: DataLike, target: Optional[str] = None,
                     max_rows: int = MAX_PROFILE_ROWS) -> "tuple[pd.DataFrame, DatasetProfile]":
     """Load + sample + type every column. Returns (working_frame, profile)."""
@@ -103,7 +141,7 @@ def profile_dataset(data: DataLike, target: Optional[str] = None,
     n_full = len(df_full)
 
     sampled = n_full > max_rows
-    df = df_full.sample(max_rows, random_state=0).reset_index(drop=True) if sampled else df_full
+    df = _sample_for_profiling(df_full, target, max_rows) if sampled else df_full
 
     if target is not None and target not in df.columns:
         raise KeyError(f"target {target!r} not found. Columns: {list(df.columns)}")

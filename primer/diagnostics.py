@@ -21,21 +21,36 @@ HIGH_COND = 1e3             # condition number above which multicollinearity is 
 IMBALANCE_WARN = 0.10        # min class share below this -> warn
 IMBALANCE_CRIT = 0.02        # ... below this -> critical
 HIGH_MISSING = 0.40
+HIGH_CARDINALITY = 20        # categorical n_unique above this is "high-cardinality"
+AUTOCORR_WARN = 0.30         # |lag-1 autocorrelation| of target above this -> sequential
+OVERLAP_WARN = 0.50          # class-separation below this -> classes overlap
+INTRINSIC_WARN = 0.50        # effective-dim / p below this -> low intrinsic dimensionality
+REDUNDANCY_WARN = 0.25       # fraction of highly-correlated feature pairs
+HETERO_WARN = 0.40           # |corr(|resid|, prediction)| above this -> heteroskedastic
 
 
 def run_diagnostics(df: "pd.DataFrame", profile: DatasetProfile,
-                    task: TaskSpec) -> List[Diagnostic]:
+                    task: TaskSpec, mf: dict = None,
+                    landmarks: list = None) -> List[Diagnostic]:
+    mf = mf or {}
+    landmarks = landmarks or []
     out: List[Diagnostic] = []
     out += _identifier_and_constant(profile)
+    out += _high_cardinality(profile)
     out += _missingness(profile)
     out += _duplicates(df)
     out += _temporal(profile)
+    out += _sequential_autocorr(mf)
     if task.kind is TaskKind.CLASSIFICATION:
         out += _imbalance(task)
+        out += _class_overlap(mf)
     if profile.target is not None and task.kind in (TaskKind.REGRESSION,
                                                      TaskKind.CLASSIFICATION):
         out += _leakage(df, profile, task)
     out += _multicollinearity(df, profile)
+    out += _low_intrinsic_dim(profile, mf)
+    out += _redundancy(mf)
+    out += _heteroskedasticity(task, landmarks)
     out.sort(key=lambda d: d.severity.rank, reverse=True)
     return out
 
@@ -162,3 +177,90 @@ def _multicollinearity(df: "pd.DataFrame", profile: DatasetProfile) -> List[Diag
                        f"high multicollinearity (condition number {cond:.0f}) — "
                        "linear-model coefficients will be unstable; prefer L2/elastic-net or trees.",
                        detail={"condition_number": round(cond, 1)})]
+
+
+# --------------------------------------------------------------------------- #
+# v2 diagnostics
+# --------------------------------------------------------------------------- #
+def _high_cardinality(profile: DatasetProfile) -> List[Diagnostic]:
+    hc = [(c.name, c.n_unique) for c in profile.columns
+          if c.ctype.value == "categorical" and c.n_unique > HIGH_CARDINALITY]
+    if not hc:
+        return []
+    cols = [n for n, _ in hc]
+    worst = max(u for _, u in hc)
+    return [Diagnostic("high_cardinality_categorical", Severity.INFO,
+                       f"{len(cols)} high-cardinality categorical column(s) (up to {worst} levels) — "
+                       "use native-categorical models (CatBoost/LightGBM) or target/hashing encoding; "
+                       "one-hot will explode the feature space, and rare levels risk overfitting.",
+                       columns=cols, detail=dict(hc))]
+
+
+def _sequential_autocorr(mf: dict) -> List[Diagnostic]:
+    ac = float(mf.get("target_autocorr", 0.0) or 0.0)
+    if abs(ac) < AUTOCORR_WARN:
+        return []
+    return [Diagnostic("sequential_autocorrelation", Severity.WARNING,
+                       f"target shows lag-1 autocorrelation {ac:+.2f} in row order — observations "
+                       "are not independent; a random k-fold split will leak. Use a chronological "
+                       "or group-wise split and consider time-series validation.",
+                       detail={"lag1_autocorr": round(ac, 3)})]
+
+
+def _class_overlap(mf: dict) -> List[Diagnostic]:
+    if "class_separation" not in mf:
+        return []
+    sep = float(mf["class_separation"])
+    lift = float(mf.get("signal_lift", 1.0))
+    # Centroid distance measures *linear* separability; if a nonlinear probe
+    # still finds signal (e.g. XOR), the classes ARE separable — don't warn.
+    if sep >= OVERLAP_WARN or lift >= 0.10:
+        return []
+    return [Diagnostic("severe_class_overlap", Severity.WARNING,
+                       f"classes are geometrically close (standardised centroid distance {sep:.2f}) "
+                       "and no cheap probe beats the baseline — they occupy nearly the same region of "
+                       "feature space, so no estimator (not even heavy boosting) will separate them. "
+                       "Revisit features or labels.",
+                       detail={"class_separation": round(sep, 3)})]
+
+
+def _low_intrinsic_dim(profile: DatasetProfile, mf: dict) -> List[Diagnostic]:
+    p = len(profile.numeric_features)
+    if p < 4 or "intrinsic_dim_ratio" not in mf:
+        return []
+    ratio = float(mf["intrinsic_dim_ratio"])
+    if ratio >= INTRINSIC_WARN:
+        return []
+    k = int(mf.get("intrinsic_dim_95", p))
+    return [Diagnostic("low_intrinsic_dimensionality", Severity.INFO,
+                       f"~{k} components explain 95% of the variance across {p} numeric features — "
+                       "the data lives on a lower-dimensional manifold; PCA / regularisation / "
+                       "feature selection will help more than added model capacity.",
+                       detail={"intrinsic_dim_95": k, "ratio": round(ratio, 3)})]
+
+
+def _redundancy(mf: dict) -> List[Diagnostic]:
+    frac = float(mf.get("frac_highly_correlated_pairs", 0.0) or 0.0)
+    if frac < REDUNDANCY_WARN:
+        return []
+    return [Diagnostic("feature_redundancy", Severity.INFO,
+                       f"{frac:.0%} of numeric feature pairs are highly correlated (|r|>0.8) — "
+                       "many features are redundant; sparse/L1 models or pruning reduce variance "
+                       "without losing signal.",
+                       detail={"frac_highly_correlated_pairs": round(frac, 3)})]
+
+
+def _heteroskedasticity(task: TaskSpec, landmarks: list) -> List[Diagnostic]:
+    if task.kind is not TaskKind.REGRESSION:
+        return []
+    h = 0.0
+    for lm in landmarks:
+        if lm.name == "linear_ridge":
+            h = float(lm.detail.get("resid_pred_corr", 0.0) or 0.0)
+    if h < HETERO_WARN:
+        return []
+    return [Diagnostic("heteroskedasticity", Severity.INFO,
+                       f"residual magnitude tracks the prediction (corr {h:.2f}) — the target's noise "
+                       "is non-constant; consider a log/Box-Cox transform of the target, or tree models "
+                       "which are agnostic to variance scaling.",
+                       detail={"resid_pred_corr": round(h, 3)})]

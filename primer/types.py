@@ -148,6 +148,7 @@ class Evidence:
     rule: str
     weight: float            # signed; positive = supports, negative = against
     text: str
+    salience: float = 1.0    # display priority; structural findings outrank priors
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

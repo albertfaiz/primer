@@ -16,6 +16,7 @@ from typing import Dict, List
 import numpy as np
 
 from . import numpyx as nx
+from . import conditioner as cond
 from .types import LandmarkResult, TaskKind
 
 MAX_LANDMARK_ROWS = 4_000      # cap the sub-sample so this stays in the millisecond range
@@ -70,11 +71,12 @@ def _train_test_split(n: int, y: np.ndarray, task: TaskKind, frac: float = 0.3,
 # models (regression)
 # --------------------------------------------------------------------------- #
 def _ridge_fit_predict(Xtr, ytr, Xte, alpha=1.0):
-    Xm, ym = Xtr.mean(0), ytr.mean()
-    Xc = Xtr - Xm
-    A = Xc.T @ Xc + alpha * np.eye(Xc.shape[1])
-    w = np.linalg.solve(A, Xc.T @ (ytr - ym))
-    return (Xte - Xm) @ w + ym
+    with np.errstate(all="ignore"):
+        Xm, ym = Xtr.mean(0), ytr.mean()
+        Xc = Xtr - Xm
+        A = Xc.T @ Xc + alpha * np.eye(Xc.shape[1])
+        w = cond.safe_solve(A, Xc.T @ (ytr - ym))
+        return (Xte - Xm) @ w + ym
 
 
 def _stump_reg_fit(Xtr, ytr):
@@ -105,14 +107,15 @@ def _stump_reg_predict(model, Xte):
 # models (classification)
 # --------------------------------------------------------------------------- #
 def _ridge_clf_fit_predict(Xtr, ytr, Xte, classes, alpha=1.0):
-    Y = nx.one_hot(ytr, classes)
-    Xm = Xtr.mean(0)
-    Xc = Xtr - Xm
-    Ym = Y.mean(0)
-    A = Xc.T @ Xc + alpha * np.eye(Xc.shape[1])
-    W = np.linalg.solve(A, Xc.T @ (Y - Ym))
-    scores = (Xte - Xm) @ W + Ym
-    return classes[np.argmax(scores, axis=1)]
+    with np.errstate(all="ignore"):
+        Y = nx.one_hot(ytr, classes)
+        Xm = Xtr.mean(0)
+        Xc = Xtr - Xm
+        Ym = Y.mean(0)
+        A = Xc.T @ Xc + alpha * np.eye(Xc.shape[1])
+        W = cond.safe_solve(A, Xc.T @ (Y - Ym))
+        scores = (Xte - Xm) @ W + Ym
+        return classes[np.argmax(scores, axis=1)]
 
 
 def _gini(y):
@@ -165,10 +168,12 @@ def _gnb_fit_predict(Xtr, ytr, Xte, classes):
 
 def _knn1_predict(Xtr, ytr, Xte):
     # squared euclidean via the (a-b)^2 = a^2 + b^2 - 2ab identity (vectorised)
-    g = Xte @ Xtr.T
-    te2 = np.sum(Xte ** 2, axis=1)[:, None]
-    tr2 = np.sum(Xtr ** 2, axis=1)[None, :]
-    d2 = te2 + tr2 - 2 * g
+    with np.errstate(all="ignore"):
+        g = Xte @ Xtr.T
+        te2 = np.sum(Xte ** 2, axis=1)[:, None]
+        tr2 = np.sum(Xtr ** 2, axis=1)[None, :]
+        d2 = te2 + tr2 - 2 * g
+        d2 = np.where(np.isfinite(d2), d2, np.inf)
     return ytr[np.argmin(d2, axis=1)]
 
 
@@ -177,12 +182,17 @@ def _knn1_predict(Xtr, ytr, Xte):
 # --------------------------------------------------------------------------- #
 def run_landmarks(Xnum: np.ndarray, y: np.ndarray, task: TaskKind,
                   seed: int = 0) -> List[LandmarkResult]:
-    """Run all applicable landmarks on the numeric feature matrix."""
+    """Run all applicable landmarks on the numeric feature matrix.
+
+    Inputs pass through the Conditioner (robust scaling + finite + full-rank),
+    so this is numerically stable on any BLAS regardless of feature scale,
+    outliers or collinearity. Scores are sanitised; nothing here can warn or crash.
+    """
     results: List[LandmarkResult] = []
     if Xnum is None or Xnum.size == 0 or Xnum.shape[1] == 0:
         return results
 
-    # sub-sample for speed
+    # sub-sample for speed (deterministic)
     rng = np.random.default_rng(seed)
     n = Xnum.shape[0]
     if n > MAX_LANDMARK_ROWS:
@@ -190,8 +200,13 @@ def run_landmarks(Xnum: np.ndarray, y: np.ndarray, task: TaskKind,
         Xnum, y = Xnum[sel], y[sel]
         n = MAX_LANDMARK_ROWS
 
-    X = nx.impute_mean(Xnum)
-    Xs, _, _ = nx.standardize(X)
+    # single robust conditioning, reused by every probe
+    X, _info = cond.condition_matrix(Xnum)
+    if X.shape[1] == 0:
+        return results
+
+    def _clean_score(v: float) -> float:
+        return float(v) if np.isfinite(v) else 0.0
 
     if task is TaskKind.REGRESSION:
         y = np.asarray(y, float)
@@ -200,16 +215,25 @@ def run_landmarks(Xnum: np.ndarray, y: np.ndarray, task: TaskKind,
             return results
 
         results.append(LandmarkResult("baseline_mean", "r2",
-                                      r2_score(y[te], np.full(len(te), y[tr].mean()))))
+                                      _clean_score(r2_score(y[te], np.full(len(te), y[tr].mean())))))
+        ridge_pred = _ridge_fit_predict(X[tr], y[tr], X[te])
+        # heteroskedasticity probe: does residual magnitude track the prediction?
+        hetero = 0.0
+        with np.errstate(all="ignore"):
+            resid = np.abs(y[te] - ridge_pred)
+            if resid.std() > nx.EPS and np.std(ridge_pred) > nx.EPS:
+                hetero = abs(float(np.corrcoef(resid, ridge_pred)[0, 1]))
+                hetero = hetero if np.isfinite(hetero) else 0.0
         results.append(LandmarkResult("linear_ridge", "r2",
-                                      r2_score(y[te], _ridge_fit_predict(Xs[tr], y[tr], Xs[te]))))
+                                      _clean_score(r2_score(y[te], ridge_pred)),
+                                      detail={"resid_pred_corr": round(hetero, 3)}))
         st = _stump_reg_fit(X[tr], y[tr])
         results.append(LandmarkResult("decision_stump", "r2",
-                                      r2_score(y[te], _stump_reg_predict(st, X[te])),
+                                      _clean_score(r2_score(y[te], _stump_reg_predict(st, X[te]))),
                                       detail={"split_feature": st["j"]}))
         ktr = tr if len(tr) <= MAX_KNN_TRAIN else rng.choice(tr, MAX_KNN_TRAIN, replace=False)
         results.append(LandmarkResult("knn1", "r2",
-                                      r2_score(y[te], _knn1_predict(Xs[ktr], y[ktr], Xs[te]))))
+                                      _clean_score(r2_score(y[te], _knn1_predict(X[ktr], y[ktr], X[te])))))
 
     elif task is TaskKind.CLASSIFICATION:
         y = np.asarray(y)
@@ -220,18 +244,18 @@ def run_landmarks(Xnum: np.ndarray, y: np.ndarray, task: TaskKind,
 
         maj = _majority(y[tr])
         results.append(LandmarkResult("baseline_majority", "balanced_accuracy",
-                                      balanced_accuracy(y[te], np.full(len(te), maj))))
+                                      _clean_score(balanced_accuracy(y[te], np.full(len(te), maj)))))
         results.append(LandmarkResult("linear_ridge_clf", "balanced_accuracy",
-                                      balanced_accuracy(y[te], _ridge_clf_fit_predict(Xs[tr], y[tr], Xs[te], classes))))
+                                      _clean_score(balanced_accuracy(y[te], _ridge_clf_fit_predict(X[tr], y[tr], X[te], classes)))))
         st = _stump_clf_fit(X[tr], y[tr])
         results.append(LandmarkResult("decision_stump", "balanced_accuracy",
-                                      balanced_accuracy(y[te], _stump_clf_predict(st, X[te])),
+                                      _clean_score(balanced_accuracy(y[te], _stump_clf_predict(st, X[te]))),
                                       detail={"split_feature": st["j"]}))
         results.append(LandmarkResult("gaussian_nb", "balanced_accuracy",
-                                      balanced_accuracy(y[te], _gnb_fit_predict(Xs[tr], y[tr], Xs[te], classes))))
+                                      _clean_score(balanced_accuracy(y[te], _gnb_fit_predict(X[tr], y[tr], X[te], classes)))))
         ktr = tr if len(tr) <= MAX_KNN_TRAIN else rng.choice(tr, MAX_KNN_TRAIN, replace=False)
         results.append(LandmarkResult("knn1", "balanced_accuracy",
-                                      balanced_accuracy(y[te], _knn1_predict(Xs[ktr], y[ktr], Xs[te]))))
+                                      _clean_score(balanced_accuracy(y[te], _knn1_predict(X[ktr], y[ktr], X[te])))))
 
     return results
 

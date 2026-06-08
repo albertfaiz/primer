@@ -12,16 +12,29 @@ Why this shape:
                    would *learn* from OpenML later, so v2 swaps weights for
                    learned ones without changing the interface.
 
+v2 changes (driven by the stress test):
+  * `salience` ranks reasons for display, so a structural finding ("linear
+    suffices", "categorical-heavy") headlines instead of a generic size prior;
+  * weak-signal is measured as **lift over the baseline learner**, which is
+    correct for both R² (baseline 0) and balanced accuracy (baseline ~0.5);
+  * the sample-size priors were down-weighted so they stop hijacking every brief;
+  * an **activation floor** keeps trivial landmark gaps from posing as structure;
+  * new rules for **intrinsic dimensionality** and **class overlap**;
+  * a **lens** hook multiplies rule strengths by domain-specific weights.
+
 Evidence targets *capabilities*, not model names, so a rule like "signal is
 nonlinear" automatically rewards every model that captures nonlinearity.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
 from .landmarking import landmark_dict
 from .types import Evidence, LandmarkResult, TaskKind, TaskSpec
+
+# landmark gaps below this are noise, not structure — don't fire structural rules
+ACTIVATION_FLOOR = 0.03
 
 
 @dataclass
@@ -51,6 +64,7 @@ class Rule:
     fires: Callable[[RuleContext], float]          # -> activation strength (0 = off, >0 on)
     votes: Callable[[RuleContext, float], CapabilityVote]
     rationale: Callable[[RuleContext, float], str]
+    salience: float = 1.0     # display priority: structural findings > generic priors
 
 
 # --------------------------------------------------------------------------- #
@@ -68,13 +82,32 @@ def _knn_score(ctx: RuleContext) -> Optional[float]:
     return ctx.lm.get("knn1")
 
 
-def _baseline_score(ctx: RuleContext) -> Optional[float]:
-    return ctx.lm.get("baseline_mean", ctx.lm.get("baseline_majority"))
+def _baseline_score(ctx: RuleContext) -> float:
+    return ctx.lm.get("baseline_mean", ctx.lm.get("baseline_majority", 0.0)) or 0.0
+
+
+def _nonbaseline(ctx: RuleContext) -> List[float]:
+    return [v for k, v in ctx.lm.items() if not k.startswith("baseline")]
 
 
 def _best_landmark(ctx: RuleContext) -> float:
-    vals = [v for k, v in ctx.lm.items() if not k.startswith("baseline")]
+    vals = _nonbaseline(ctx)
     return max(vals) if vals else 0.0
+
+
+def _signal_lift(ctx: RuleContext) -> float:
+    """Best probe minus the baseline learner — the universal 'is there signal?'.
+
+    Works across metrics: R² baseline is 0, balanced-accuracy baseline is ~0.5,
+    so the *lift* is the comparable quantity (this is the v1 bug that let pure
+    noise look learnable in classification)."""
+    if not _nonbaseline(ctx):
+        return 0.0
+    return _best_landmark(ctx) - _baseline_score(ctx)
+
+
+def _has_landmarks(ctx: RuleContext) -> bool:
+    return len(_nonbaseline(ctx)) > 0
 
 
 # --------------------------------------------------------------------------- #
@@ -86,11 +119,13 @@ RULES: List[Rule] = [
     Rule(
         "nonlinearity_present",
         "A single threshold (stump) beats the linear model, so the signal is nonlinear.",
-        fires=lambda c: max(0.0, (_stump_score(c) or 0) - (_linear_score(c) or 0))
-        if _stump_score(c) is not None and _linear_score(c) is not None else 0.0,
+        fires=lambda c: (max(0.0, (_stump_score(c) or 0) - (_linear_score(c) or 0))
+                         if _stump_score(c) is not None and _linear_score(c) is not None
+                         and (_stump_score(c) - _linear_score(c)) > ACTIVATION_FLOOR else 0.0),
         votes=lambda c, s: {"nonlinearity": 3.0 * min(s, 0.4),
                             "interactions": 1.5 * min(s, 0.4)},
-        rationale=lambda c, s: f"stump outperforms the linear model by {s:.2f} — nonlinear structure favours trees/boosting.",
+        rationale=lambda c, s: f"a single threshold beats the linear model by {s:.2f} — nonlinear structure favours trees/boosting.",
+        salience=2.2,
     ),
 
     # 2. linear model already near the ceiling --------------------------------
@@ -100,29 +135,32 @@ RULES: List[Rule] = [
         fires=lambda c: 1.0 if (_linear_score(c) or 0) >= 0.9
         and ((_stump_score(c) or 0) - (_linear_score(c) or 0)) < 0.05 else 0.0,
         votes=lambda c, s: {"nonlinearity": -1.6, "interactions": -1.2, "interpretable": 1.0},
-        rationale=lambda c, s: "a simple linear model already scores very high; complex models add little and cost interpretability.",
+        rationale=lambda c, s: f"a linear model already scores {(_linear_score(c) or 0):.2f}; added model complexity buys little and costs interpretability.",
+        salience=3.0,
     ),
 
     # 3. local structure: 1-NN beats linear -----------------------------------
     Rule(
         "local_structure",
         "1-NN beats the linear model, indicating local / neighbourhood structure.",
-        fires=lambda c: max(0.0, (_knn_score(c) or 0) - (_linear_score(c) or 0))
-        if _knn_score(c) is not None and _linear_score(c) is not None else 0.0,
+        fires=lambda c: (max(0.0, (_knn_score(c) or 0) - (_linear_score(c) or 0))
+                         if _knn_score(c) is not None and _linear_score(c) is not None
+                         and (_knn_score(c) - _linear_score(c)) > ACTIVATION_FLOOR else 0.0),
         votes=lambda c, s: {"local_structure": 2.5 * min(s, 0.4),
                             "nonlinearity": 1.0 * min(s, 0.4)},
         rationale=lambda c, s: f"1-NN beats linear by {s:.2f} — neighbourhood structure rewards kNN and tree ensembles.",
+        salience=2.2,
     ),
 
-    # 4. weak signal everywhere (high noise) ----------------------------------
+    # 4. weak signal everywhere (high noise) — measured as lift over baseline --
     Rule(
         "low_signal_high_noise",
-        "Even the best landmark barely beats the baseline — signal is weak / noisy.",
-        fires=lambda c: 1.0 if len([k for k in c.lm if not k.startswith("baseline")]) > 0
-        and _best_landmark(c) < 0.15 else 0.0,
-        votes=lambda c, s: {"interpretable": 1.0, "fast_train": 1.0,
-                            "nonlinearity": -0.8, "interactions": -0.8},
-        rationale=lambda c, s: "no cheap model finds much signal — favour simple, regularised models and invest in features rather than complex estimators.",
+        "Even the best landmark barely beats the baseline learner — signal is weak / noisy.",
+        fires=lambda c: 1.0 if _has_landmarks(c) and _signal_lift(c) < ACTIVATION_FLOOR else 0.0,
+        votes=lambda c, s: {"interpretable": 1.2, "fast_train": 1.0,
+                            "nonlinearity": -1.0, "interactions": -1.0},
+        rationale=lambda c, s: f"the best cheap probe beats the baseline by only {_signal_lift(c):+.2f} — there is little learnable signal; invest in features/data, not a fancier model.",
+        salience=3.0,
     ),
 
     # 5. large n -> favour scalable, penalise quadratic methods ---------------
@@ -133,16 +171,18 @@ RULES: List[Rule] = [
         (0.5 if c.f("n_rows") >= 20_000 else 0.0),
         votes=lambda c, s: {"scales_large_n": 2.0 * s, "fast_train": 1.0 * s},
         rationale=lambda c, s: f"{int(c.f('n_rows')):,} rows — prioritise fast, scalable learners (LightGBM, linear).",
+        salience=0.8,
     ),
 
-    # 6. small n -> penalise data-hungry models -------------------------------
+    # 6. small n -> penalise data-hungry models (down-weighted in v2) ----------
     Rule(
         "small_sample",
         "Few rows — penalise neural nets / deep models, favour regularised & low-n-friendly.",
-        fires=lambda c: 1.0 if c.f("n_rows") < 500 else
-        (0.5 if c.f("n_rows") < 2_000 else 0.0),
-        votes=lambda c, s: {"low_n_friendly": 1.8 * s, "interpretable": 0.6 * s},
+        fires=lambda c: 1.0 if c.f("n_rows") < 300 else
+        (0.4 if c.f("n_rows") < 1_500 else 0.0),
+        votes=lambda c, s: {"low_n_friendly": 1.2 * s, "interpretable": 0.4 * s},
         rationale=lambda c, s: f"only {int(c.f('n_rows')):,} rows — data-hungry models overfit; prefer regularised/low-variance learners and strong cross-validation.",
+        salience=0.5,
     ),
 
     # 7. wide data (p large vs n) ---------------------------------------------
@@ -153,21 +193,35 @@ RULES: List[Rule] = [
         (0.5 if c.f("n_to_p_ratio", 1e9) < 20 else 0.0),
         votes=lambda c, s: {"high_dim_friendly": 2.0 * s, "low_n_friendly": 0.5 * s},
         rationale=lambda c, s: f"n/p ratio is {c.f('n_to_p_ratio'):.1f} — wide data favours sparse linear (L1) and regularised models; raw deep nets overfit.",
+        salience=1.4,
     ),
 
-    # 8. many / high-cardinality categoricals ---------------------------------
+    # 8. low intrinsic dimensionality (effective rank << p) -------------------
+    Rule(
+        "low_intrinsic_dim",
+        "Few principal components explain the variance — effective dimension is low.",
+        fires=lambda c: 1.0 - c.f("intrinsic_dim_ratio", 1.0)
+        if c.f("intrinsic_dim_ratio", 1.0) < 0.5 and c.f("n_numeric") >= 4 else 0.0,
+        votes=lambda c, s: {"high_dim_friendly": 1.4 * s, "interpretable": 0.5 * s,
+                            "nonlinearity": -0.3 * s},
+        rationale=lambda c, s: f"~{int(c.f('intrinsic_dim_95'))} components carry 95% of the variance — the data is effectively low-dimensional; regularise or reduce before adding capacity.",
+        salience=2.0,
+    ),
+
+    # 9. many / high-cardinality categoricals ---------------------------------
     Rule(
         "categorical_heavy",
         "Categorical features dominate, especially high-cardinality ones.",
         fires=lambda c: min(1.0, c.f("frac_categorical")) *
         (1.0 + min(1.0, c.f("n_high_cardinality_cat") / 3.0)),
-        votes=lambda c, s: {"native_categorical": 2.2 * min(s, 1.5)},
+        votes=lambda c, s: {"native_categorical": 2.4 * min(s, 1.5)},
         rationale=lambda c, s: f"{c.f('frac_categorical'):.0%} of features are categorical"
         + (f" ({int(c.f('n_high_cardinality_cat'))} high-cardinality)" if c.f("n_high_cardinality_cat") else "")
         + " — models with native categorical handling (CatBoost, LightGBM) avoid one-hot blow-up.",
+        salience=2.6,
     ),
 
-    # 9. substantial missingness ----------------------------------------------
+    # 10. substantial missingness ---------------------------------------------
     Rule(
         "missing_values",
         "Non-trivial missingness — favour models that tolerate it natively.",
@@ -175,9 +229,10 @@ RULES: List[Rule] = [
         (0.5 if c.f("overall_missing_frac") > 0.05 else 0.0),
         votes=lambda c, s: {"robust_missing": 1.8 * s},
         rationale=lambda c, s: f"up to {c.f('max_missing_frac'):.0%} missing in some columns — boosting handles NaNs natively; linear/kNN need imputation first.",
+        salience=1.6,
     ),
 
-    # 10. heavy tails / outliers ----------------------------------------------
+    # 11. heavy tails / outliers ----------------------------------------------
     Rule(
         "outliers_heavy_tails",
         "Skewed, heavy-tailed features with many outliers.",
@@ -185,9 +240,10 @@ RULES: List[Rule] = [
         (0.5 if c.f("mean_abs_skew") > 1.0 else 0.0),
         votes=lambda c, s: {"robust_outliers": 1.5 * s, "needs_scaling": -0.8 * s},
         rationale=lambda c, s: f"heavy tails (mean |skew| {c.f('mean_abs_skew'):.1f}, outlier rate {c.f('mean_outlier_frac'):.0%}) — tree models are robust; distance/linear models need transforms.",
+        salience=1.0,
     ),
 
-    # 11. multicollinearity ----------------------------------------------------
+    # 12. multicollinearity ----------------------------------------------------
     Rule(
         "multicollinearity",
         "Strongly correlated features destabilise linear coefficients.",
@@ -195,9 +251,10 @@ RULES: List[Rule] = [
         (0.5 if c.f("frac_highly_correlated_pairs") > 0.1 else 0.0),
         votes=lambda c, s: {"nonlinearity": 0.4 * s},  # gently nudge toward trees/L2
         rationale=lambda c, s: "correlated features make plain linear coefficients unstable — prefer L2/elastic-net or tree models, which are unaffected.",
+        salience=1.3,
     ),
 
-    # 12. class imbalance ------------------------------------------------------
+    # 13. class imbalance ------------------------------------------------------
     Rule(
         "class_imbalance",
         "Minority class is rare — favour models supporting class weighting.",
@@ -205,9 +262,21 @@ RULES: List[Rule] = [
         (0.5 if c.f("min_class_frac", 1.0) < 0.15 else 0.0),
         votes=lambda c, s: {"class_weighting": 1.5 * s},
         rationale=lambda c, s: f"minority class is {c.f('min_class_frac'):.0%} — use class weights / resampling and evaluate with PR-AUC or F1.",
+        salience=2.6,
     ),
 
-    # 13. strong, concentrated signal -> simple models viable -----------------
+    # 14. severe class overlap — capacity won't help (only when NO signal) ----
+    Rule(
+        "class_overlap",
+        "Class centroids nearly coincide AND no probe finds signal — not separable.",
+        fires=lambda c: 1.0 if 0 < c.f("class_separation", 1.0) < 0.5
+        and c.f("signal_lift", 1.0) < 0.10 else 0.0,
+        votes=lambda c, s: {"interpretable": 0.8, "nonlinearity": -0.6, "robust_outliers": 0.4},
+        rationale=lambda c, s: f"class centroids are only {c.f('class_separation'):.2f} apart in standardised space and no cheap probe beats the baseline — the classes overlap, so model capacity won't rescue separability; fix features/labels.",
+        salience=2.4,
+    ),
+
+    # 15. strong, concentrated signal -> simple models viable -----------------
     Rule(
         "few_informative_features",
         "A handful of features carry most of the dependence with the target.",
@@ -215,28 +284,76 @@ RULES: List[Rule] = [
         and c.f("max_target_mi") > 0.2 else 0.0,
         votes=lambda c, s: {"interpretable": 1.0, "high_dim_friendly": 0.8},
         rationale=lambda c, s: "only a few features are strongly informative — sparse/interpretable models can match complex ones with far less risk.",
+        salience=1.5,
+    ),
+
+    # 16. heteroskedastic target — non-constant variance (regression) ---------
+    Rule(
+        "heteroskedastic_target",
+        "Residual magnitude grows with the prediction — variance is non-constant.",
+        fires=lambda c: 1.0 if c.f("heteroskedasticity", 0.0) > 0.40 else
+        (0.5 if c.f("heteroskedasticity", 0.0) > 0.25 else 0.0),
+        votes=lambda c, s: {"robust_outliers": 1.2 * s, "needs_scaling": -0.4 * s},
+        rationale=lambda c, s: f"residual magnitude tracks the prediction (corr {c.f('heteroskedasticity'):.2f}) — the target's noise is non-constant; consider a log/Box-Cox transform of the target, or tree models that are agnostic to variance scaling.",
+        salience=1.8,
     ),
 ]
 
 
-def apply_rules(ctx: RuleContext, rules: Optional[List[Rule]] = None
+# a capability lens with multiplier m contributes a standing bias of
+# (m - 1) * LENS_GAIN toward that capability, so a lens works even when no rule
+# fires (e.g. "interpretable": 5 rewards interpretable models directly).
+LENS_GAIN = 0.6
+
+
+def apply_rules(ctx: RuleContext, rules: Optional[List[Rule]] = None,
+                lens: Optional[Dict[str, float]] = None
                 ) -> "tuple[Dict[str, float], List[tuple]]":
     """Run all rules. Returns (capability_votes, fired_log).
 
     capability_votes: capability -> summed signed weight across fired rules
-    fired_log: list of (rule_name, activation, votes, rationale)
+    fired_log: list of (rule_name, activation, votes, rationale, salience)
+
+    `lens` is an optional ``{key: multiplier}`` map (see ``primer.lenses``). A key
+    is matched two ways, so a domain expert can target either layer:
+      * a **rule name** scales that rule's activation strength;
+      * a **capability name** scales existing votes for that capability AND adds a
+        standing bias ``(multiplier - 1) * LENS_GAIN`` toward it — so the lens
+        still bites even when no rule fired. ``0.0`` zeroes a capability out;
+        ``>1`` amplifies it.
     """
     rules = rules or RULES
+    lens = lens or {}
+    rule_names = {r.name for r in rules}
+    rule_lens = {k: float(v) for k, v in lens.items() if k in rule_names}
+    cap_lens = {k: float(v) for k, v in lens.items() if k not in rule_names}
+
     cap_votes: Dict[str, float] = {}
     fired = []
     for rule in rules:
-        strength = float(rule.fires(ctx))
+        strength = float(rule.fires(ctx)) * rule_lens.get(rule.name, 1.0)
         if strength <= 0:
             continue
         votes = rule.votes(ctx, strength)
+        if cap_lens:                                   # 0.0 zeroes, >1 amplifies
+            votes = {cap: w * cap_lens.get(cap, 1.0) for cap, w in votes.items()}
         for cap, w in votes.items():
             cap_votes[cap] = cap_votes.get(cap, 0.0) + w
-        fired.append((rule.name, strength, votes, rule.rationale(ctx, strength)))
+        fired.append((rule.name, strength, votes, rule.rationale(ctx, strength),
+                      rule.salience))
+
+    # standing capability preference from the lens (independent of which rules fired)
+    if cap_lens:
+        lens_votes = {cap: (m - 1.0) * LENS_GAIN
+                      for cap, m in cap_lens.items() if abs(m - 1.0) > 1e-9}
+        if lens_votes:
+            for cap, w in lens_votes.items():
+                cap_votes[cap] = cap_votes.get(cap, 0.0) + w
+            parts = ", ".join(f"{'favour' if m > 1 else 'avoid'} {cap}"
+                              for cap, m in cap_lens.items())
+            fired.append(("domain_lens", 1.0, lens_votes,
+                          f"domain lens applied — {parts}.", 3.0))
+
     return cap_votes, fired
 
 

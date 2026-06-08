@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Union
 import pandas as pd
 
 from . import ingest, metafeatures as mfx, task as taskmod
+from . import lenses as lensmod
 from .diagnostics import run_diagnostics
 from .landmarking import run_landmarks
 from .recommend import (Recommender, RuleBasedRecommender, overall_confidence)
@@ -26,32 +27,55 @@ class Primer:
     def __init__(self,
                  recommender: Optional[Recommender] = None,
                  validator: Optional[ProxyValidator] = None,
+                 lens: Optional[Union[str, Dict[str, float]]] = None,
                  max_profile_rows: int = ingest.MAX_PROFILE_ROWS):
-        self.recommender = recommender or RuleBasedRecommender()
+        self.lens = lensmod.resolve_lens(lens)
+        self.recommender = recommender or RuleBasedRecommender(lens=self.lens)
         self.validator = validator or NullValidator()
         self.max_profile_rows = max_profile_rows
 
     def analyze(self, data: DataLike, target: Optional[str] = None) -> PrimerReport:
-        # Layer 1 — ingest + type
+        # Numerical safety net. Every kernel is already conditioned and
+        # errstate-guarded individually; this top-level guard additionally
+        # silences the spurious matmul RuntimeWarnings that some BLAS builds
+        # (notably Apple Accelerate) emit even on benign products — guaranteeing
+        # a warning-free run on any platform, not just the one we tested on.
+        import numpy as _np
+        with _np.errstate(all="ignore"):
+            return self._run(data, target)
+
+    def _run(self, data: DataLike, target: Optional[str] = None) -> PrimerReport:
+        # Layer 1 — ingest + type (+ memory-safe stratified sampling)
         df, profile = ingest.profile_dataset(data, target, self.max_profile_rows)
 
         # Layer 2 — task
         task = taskmod.resolve_task(df, profile)
 
-        # Layer 3 — diagnostics
-        diagnostics = run_diagnostics(df, profile, task)
-
-        # Layer 4a — metafeatures (+ numeric matrix)
+        # Layer 4a — metafeatures (+ numeric matrix). Computed BEFORE diagnostics
+        # in v2 so the diagnostic layer can consume intrinsic dimensionality,
+        # class overlap, autocorrelation, etc.
         metafeatures = mfx.extract_metafeatures(df, profile, task)
 
-        # Layer 4b — landmarks (supervised tasks only)
+        # Layer 4b — landmarks (supervised tasks only), through the Conditioner
         landmarks = []
         if task.kind in (TaskKind.REGRESSION, TaskKind.CLASSIFICATION) and profile.target:
             Xnum, _ = mfx.build_numeric_matrix(df, profile)
             y = mfx._encode_target(df, profile.target, task)
             landmarks = run_landmarks(Xnum, y, task.kind)
+            # record the universal signal measure for the brief
+            nb = [l.score for l in landmarks if not l.name.startswith("baseline")]
+            bl = [l.score for l in landmarks if l.name.startswith("baseline")]
+            if nb:
+                metafeatures["signal_lift"] = round(max(nb) - (max(bl) if bl else 0.0), 4)
+            for l in landmarks:
+                if l.name == "linear_ridge":
+                    metafeatures["heteroskedasticity"] = float(
+                        l.detail.get("resid_pred_corr", 0.0) or 0.0)
 
-        # Layer 5 — recommend
+        # Layer 3 — diagnostics (now metafeature- and landmark-aware)
+        diagnostics = run_diagnostics(df, profile, task, metafeatures, landmarks)
+
+        # Layer 5 — recommend (lens-aware)
         recommendations = self.recommender.recommend(task, metafeatures, landmarks)
 
         # Layer 6 — optional cheap-proxy validation (no-op by default)
@@ -100,11 +124,21 @@ def _build_directions(report: PrimerReport) -> List[str]:
         if diag.name == "class_imbalance" and diag.severity in (Severity.WARNING, Severity.CRITICAL):
             d.append("For the imbalance, use class weights or resampling and report PR-AUC / F1 "
                      "rather than raw accuracy.")
-        if diag.name == "temporal_columns":
-            d.append("Datetime present: validate with a chronological split, not random k-fold.")
+        if diag.name in ("temporal_columns", "sequential_autocorrelation"):
+            d.append("Validate with a chronological / group-wise split, not random k-fold — "
+                     "the rows are not independent.")
         if diag.name == "high_missingness":
             d.append("Address the heavily-missing columns (impute or drop) — or lean on boosting, "
                      "which handles NaNs natively.")
+        if diag.name == "high_cardinality_categorical":
+            d.append("Encode the high-cardinality column(s) with target/hashing encoding, or use "
+                     "CatBoost/LightGBM directly rather than one-hot.")
+        if diag.name == "severe_class_overlap":
+            d.append("The classes overlap geometrically — before tuning models, check whether the "
+                     "features actually carry class-separating information.")
+        if diag.name == "low_intrinsic_dimensionality":
+            d.append("Effective dimensionality is low — try PCA or L1/L2 regularisation before "
+                     "adding model capacity.")
 
     # task-flavoured next step
     if task.kind is TaskKind.UNSUPERVISED:
@@ -112,11 +146,11 @@ def _build_directions(report: PrimerReport) -> List[str]:
                  "compression (PCA/UMAP), or outlier detection (Isolation Forest) — the "
                  "shortlist covers all three.")
     elif report.landmarks:
-        best = max((l.score for l in report.landmarks
-                    if not l.name.startswith("baseline")), default=0.0)
-        if best < 0.15:
-            d.append("Cheap models found little signal — invest in feature engineering or "
-                     "more data before chasing a fancier estimator.")
+        lift = report.metafeatures.get("signal_lift", None)
+        if lift is not None and lift < 0.03:
+            d.append("Cheap probes barely beat the baseline — there is little learnable signal. "
+                     "Invest in feature engineering or more/better data before chasing a fancier "
+                     "estimator; a complex model here would only overfit noise.")
 
     d.append("These are heuristic priors, not benchmarked results — treat the shortlist as "
              "where to *start*, then let a quick empirical comparison settle the winner.")
@@ -124,6 +158,11 @@ def _build_directions(report: PrimerReport) -> List[str]:
 
 
 # module-level convenience -------------------------------------------------- #
-def analyze(data: DataLike, target: Optional[str] = None) -> PrimerReport:
-    """One-call entry point: ``primer.analyze('data.csv', target='y')``."""
-    return Primer().analyze(data, target)
+def analyze(data: DataLike, target: Optional[str] = None,
+            lens: Optional[Union[str, Dict[str, float]]] = None) -> PrimerReport:
+    """One-call entry point: ``primer.analyze('data.csv', target='y')``.
+
+    Optional ``lens`` applies a domain weight profile (see ``primer.lenses``),
+    e.g. ``primer.analyze(df, target='y', lens='genomics')``.
+    """
+    return Primer(lens=lens).analyze(data, target)
