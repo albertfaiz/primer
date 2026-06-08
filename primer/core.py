@@ -18,7 +18,7 @@ from .landmarking import run_landmarks
 from .recommend import (Recommender, RuleBasedRecommender, overall_confidence)
 from .report import render_full
 from .types import (PrimerReport, Severity, TaskKind)
-from .validate import NullValidator, ProxyValidator
+from .validate import NullValidator, ProxyValidator, SuccessiveHalvingValidator
 
 DataLike = Union[str, "pd.DataFrame"]
 
@@ -28,10 +28,23 @@ class Primer:
                  recommender: Optional[Recommender] = None,
                  validator: Optional[ProxyValidator] = None,
                  lens: Optional[Union[str, Dict[str, float]]] = None,
+                 validate: bool = False,
                  max_profile_rows: int = ingest.MAX_PROFILE_ROWS):
         self.lens = lensmod.resolve_lens(lens)
         self.recommender = recommender or RuleBasedRecommender(lens=self.lens)
-        self.validator = validator or NullValidator()
+        if validator is not None:
+            self.validator = validator
+        elif validate:
+            self.validator = SuccessiveHalvingValidator()
+            if not self.validator.available:
+                import warnings
+                warnings.warn(
+                    "validate=True requires scikit-learn, which is not installed. "
+                    "Proceeding with the heuristic shortlist only (no Layer 6 "
+                    "empirical validation). Install it with: pip install scikit-learn",
+                    stacklevel=2)
+        else:
+            self.validator = NullValidator()
         self.max_profile_rows = max_profile_rows
 
     def analyze(self, data: DataLike, target: Optional[str] = None) -> PrimerReport:
@@ -78,18 +91,32 @@ class Primer:
         # Layer 5 — recommend (lens-aware)
         recommendations = self.recommender.recommend(task, metafeatures, landmarks)
 
-        # Layer 6 — optional cheap-proxy validation (no-op by default)
-        if getattr(self.validator, "available", False) and recommendations:
-            recommendations = self.validator.validate(
-                df, profile, task, recommendations[:3]) + recommendations[3:]
+        # Layer 6 — optional empirical validation (successive halving). The
+        # validator returns the shortlist re-ranked by MEASURED CV score and
+        # attaches per-model results; it no-ops if unavailable (no sklearn) or
+        # for unsupervised tasks.
+        validated = False
+        val_summary = None
+        if getattr(self.validator, "available", False) and recommendations and \
+           task.kind in (TaskKind.REGRESSION, TaskKind.CLASSIFICATION):
+            recommendations = self.validator.validate(df, profile, task, recommendations)
+            val_summary = getattr(self.validator, "last_summary", None)
+            validated = val_summary is not None
 
-        conf, label = overall_confidence(recommendations)
+        # Layer 7 — confidence. When validation ran, the overall figure is the
+        # empirical *decisiveness* (honest, not a calibrated probability); else
+        # it falls back to the heuristic separation signal.
+        if validated:
+            conf, label = float(val_summary["decisiveness"]), val_summary["label"]
+        else:
+            conf, label = overall_confidence(recommendations)
 
         report = PrimerReport(
             profile=profile, task=task, diagnostics=diagnostics,
             metafeatures=metafeatures, landmarks=landmarks,
             recommendations=recommendations,
             confidence_overall=conf, confidence_label=label,
+            validated=validated, validation_summary=val_summary,
         )
         report.directions = _build_directions(report)
         return report
@@ -107,14 +134,28 @@ def _build_directions(report: PrimerReport) -> List[str]:
 
     if recs:
         top = recs[0].model
-        runners = ", ".join(r.model for r in recs[1:3])
-        d.append(f"Start with {top}"
-                 + (f", and benchmark it against {runners} before committing compute." if runners else "."))
+        if report.validated and recs[0].validation:
+            v = recs[0].validation
+            s = report.validation_summary or {}
+            metric = v.get("metric", "score")
+            tail = ("the heuristic prior agreed." if s.get("agreement")
+                    else f"this overturned the prior favourite ({s.get('heuristic_top')}) — "
+                         "trust the measurement.")
+            d.append(f"Empirically, {top} scored best under subsample cross-validation "
+                     f"({v.get('cv_score'):.3f} {metric}, ±{v.get('cv_std'):.3f}); {tail}")
+        else:
+            runners = ", ".join(r.model for r in recs[1:3])
+            d.append(f"Start with {top}"
+                     + (f", and benchmark it against {runners} before committing compute." if runners else "."))
 
     # confidence-aware guidance
-    if report.confidence_overall < 0.5 and len(recs) >= 2:
-        d.append("Confidence is only moderate/low — the top two are close, so run the "
-                 "cheap-proxy comparison (small sub-sample, tiny budget) before a full run.")
+    if report.validated and report.confidence_overall < 0.45:
+        d.append("Empirical decisiveness is low — the top candidates are within fold-to-fold "
+                 "noise of each other. Treat them as a tie and pick on secondary criteria "
+                 "(speed, interpretability, maintenance).")
+    elif (not report.validated) and report.confidence_overall < 0.5 and len(recs) >= 2:
+        d.append("Confidence is only moderate/low — the top two are close, so run validate=True "
+                 "(cheap-proxy comparison) before committing to a full run.")
 
     # diagnostics -> actions
     for diag in report.diagnostics:
@@ -159,10 +200,13 @@ def _build_directions(report: PrimerReport) -> List[str]:
 
 # module-level convenience -------------------------------------------------- #
 def analyze(data: DataLike, target: Optional[str] = None,
-            lens: Optional[Union[str, Dict[str, float]]] = None) -> PrimerReport:
+            lens: Optional[Union[str, Dict[str, float]]] = None,
+            validate: bool = False) -> PrimerReport:
     """One-call entry point: ``primer.analyze('data.csv', target='y')``.
 
-    Optional ``lens`` applies a domain weight profile (see ``primer.lenses``),
-    e.g. ``primer.analyze(df, target='y', lens='genomics')``.
+    Optional ``lens`` applies a domain weight profile (see ``primer.lenses``).
+    Optional ``validate=True`` runs Layer 6 — empirical successive-halving
+    validation of the shortlist (requires scikit-learn; no-ops without it) — and
+    reports measured CV scores plus an honest decisiveness figure.
     """
-    return Primer(lens=lens).analyze(data, target)
+    return Primer(lens=lens, validate=validate).analyze(data, target)
